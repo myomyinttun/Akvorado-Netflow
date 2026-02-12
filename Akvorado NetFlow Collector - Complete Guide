@@ -1,0 +1,1023 @@
+# Akvorado NetFlow Collector - Complete Guide
+
+**Version:** 2.1.1
+**Author:** NetFlow Setup
+**Last Updated:** 2026-02-13
+
+---
+
+## Table of Contents
+
+1. [Architecture Overview](#1-architecture-overview)
+2. [Prerequisites](#2-prerequisites)
+3. [Installation](#3-installation)
+4. [Configuration](#4-configuration)
+5. [Service Management](#5-service-management)
+6. [Static Interface Metadata](#6-static-interface-metadata)
+7. [BMP Configuration](#7-bmp-configuration)
+8. [GeoIP Setup](#8-geoip-setup)
+9. [Grafana Integration](#9-grafana-integration)
+10. [ClickHouse Queries](#10-clickhouse-queries)
+11. [Backup & Restoration](#11-backup--restoration)
+12. [Capacity Planning](#12-capacity-planning)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Quick Reference](#14-quick-reference)
+
+---
+
+## 1. Architecture Overview
+
+### Component Diagram
+
+```
+                         ┌─────────────────────┐
+                         │   Router/Switch     │
+                         │   (NetFlow/sFlow)   │
+                         └──────────┬──────────┘
+                                    │
+                    NetFlow UDP:2055 / sFlow UDP:6343
+                    BMP TCP:10179
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      AKVORADO SERVER                             │
+│                                                                  │
+│  ┌──────────────┐                           ┌──────────────┐    │
+│  │ Orchestrator │◄──────────────────────────│   Console    │    │
+│  │   :8080      │                           │   :8083      │    │
+│  │  (Config)    │                           │  (Web UI)    │    │
+│  └──────┬───────┘                           └──────────────┘    │
+│         │                                                        │
+│         │ Configuration                                          │
+│         ▼                                                        │
+│  ┌──────────────┐         ┌──────────────┐  ┌──────────────┐    │
+│  │    Inlet     │────────▶│    Kafka     │──▶│   Outlet     │    │
+│  │   :8081      │  Flows  │   :9092      │   │   :8082      │    │
+│  │ (Collector)  │         │  (Queue)     │   │ (Processor)  │    │
+│  └──────────────┘         └──────────────┘  └──────┬───────┘    │
+│         ▲                        ▲                  │            │
+│         │                        │                  ▼            │
+│    UDP:2055/6343           Zookeeper        ┌──────────────┐    │
+│    TCP:10179 (BMP)          :2181           │  ClickHouse  │    │
+│                                             │   :9000      │    │
+│                                             │  (Database)  │    │
+│                                             └──────────────┘    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### Service Ports
+
+| Port | Protocol | Service | Description |
+|------|----------|---------|-------------|
+| 8080 | TCP | Orchestrator | Configuration API |
+| 8081 | TCP | Inlet | Flow collector API |
+| 8082 | TCP | Outlet | Processor API |
+| 8083 | TCP | Console | Web UI |
+| 2055 | UDP | Inlet | NetFlow/IPFIX |
+| 6343 | UDP | Inlet | sFlow |
+| 10179 | TCP | Outlet | BMP (BGP Monitoring) |
+| 9092 | TCP | Kafka | Message broker |
+| 2181 | TCP | Zookeeper | Kafka coordination |
+| 9000 | TCP | ClickHouse | Database (native) |
+| 8123 | TCP | ClickHouse | Database (HTTP) |
+
+### Data Flow
+
+1. **Router** exports NetFlow/IPFIX/sFlow to Inlet
+2. **Inlet** receives flows, sends to Kafka
+3. **Kafka** queues flow messages
+4. **Outlet** consumes from Kafka, enriches with metadata/GeoIP/BMP
+5. **Outlet** writes to ClickHouse
+6. **Console** queries ClickHouse for visualization
+
+---
+
+## 2. Prerequisites
+
+### Software Requirements
+
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| Ubuntu/Debian | 20.04+ | Operating System |
+| Akvorado | 2.1.1 | Flow collector |
+| Kafka | 2.13-3.9.1 | Message queue |
+| Zookeeper | (with Kafka) | Coordination |
+| ClickHouse | 26.x+ | Time-series database |
+| GeoIP | GeoLite2 | IP geolocation |
+
+### Hardware Requirements (Single Server)
+
+| Traffic | CPU | RAM | Storage | Network |
+|---------|-----|-----|---------|---------|
+| < 10 Gbps | 8 cores | 32 GB | 1 TB SSD | 1 Gbps |
+| 10-100 Gbps | 16 cores | 64 GB | 5 TB SSD | 10 Gbps |
+| 100-500 Gbps | 32 cores | 128 GB | 10 TB NVMe | 25 Gbps |
+| 500-700 Gbps | 64+ cores | 256+ GB | 20+ TB NVMe | 25-100 Gbps |
+
+---
+
+## 3. Installation
+
+### 3.1 Install ClickHouse
+
+```bash
+# Add repository
+sudo apt-get install -y apt-transport-https ca-certificates dirmngr
+sudo apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv 8919F6BD2B48D754
+echo "deb https://packages.clickhouse.com/deb stable main" | sudo tee /etc/apt/sources.list.d/clickhouse.list
+
+# Install
+sudo apt-get update
+sudo apt-get install -y clickhouse-server clickhouse-client
+
+# Set password
+sudo mkdir -p /etc/clickhouse-server/users.d
+cat << 'EOF' | sudo tee /etc/clickhouse-server/users.d/default-password.xml
+<clickhouse>
+    <users>
+        <default>
+            <password>netflow2026</password>
+        </default>
+    </users>
+</clickhouse>
+EOF
+
+# Enable remote access
+cat << 'EOF' | sudo tee /etc/clickhouse-server/config.d/listen.xml
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+</clickhouse>
+EOF
+
+# Start service
+sudo systemctl enable clickhouse-server
+sudo systemctl start clickhouse-server
+
+# Create database
+clickhouse-client --password 'netflow2026' --query "CREATE DATABASE IF NOT EXISTS akvorado"
+```
+
+### 3.2 Install Kafka & Zookeeper
+
+```bash
+# Download Kafka
+cd /opt
+sudo wget https://downloads.apache.org/kafka/3.9.1/kafka_2.13-3.9.1.tgz
+sudo tar -xzf kafka_2.13-3.9.1.tgz
+sudo rm kafka_2.13-3.9.1.tgz
+
+# Start Zookeeper
+nohup /opt/kafka_2.13-3.9.1/bin/zookeeper-server-start.sh \
+  /opt/kafka_2.13-3.9.1/config/zookeeper.properties > /var/log/zookeeper.log 2>&1 &
+
+# Start Kafka
+nohup /opt/kafka_2.13-3.9.1/bin/kafka-server-start.sh \
+  /opt/kafka_2.13-3.9.1/config/server.properties > /var/log/kafka.log 2>&1 &
+```
+
+### 3.3 Install Akvorado
+
+```bash
+# Download Akvorado
+VERSION="2.1.1"
+wget https://github.com/akvorado/akvorado/releases/download/v${VERSION}/akvorado-linux-amd64
+sudo mv akvorado-linux-amd64 /usr/local/bin/akvorado
+sudo chmod +x /usr/local/bin/akvorado
+
+# Create config directory
+sudo mkdir -p /etc/akvorado
+sudo mkdir -p /var/lib/akvorado/geoip
+```
+
+---
+
+## 4. Configuration
+
+### 4.1 Main Configuration File
+
+Location: `/etc/akvorado/config.yaml`
+
+```yaml
+http:
+  listen: 172.16.3.101:8080
+
+geoip:
+  asn-database: /var/lib/akvorado/geoip/GeoLite2-ASN.mmdb
+  geo-database: /var/lib/akvorado/geoip/GeoLite2-City.mmdb
+
+kafka:
+  topic: netplan-flows
+  brokers:
+    - 127.0.0.1:9092
+
+clickhouse:
+  servers:
+    - 127.0.0.1:9000
+  database: akvorado
+  username: default
+  password: netflow2026
+
+inlet:
+  - http:
+      listen: 127.0.0.1:8081
+    flow:
+      inputs:
+        - type: udp
+          decoder: netflow
+          listen: 103.27.116.65:2055
+          workers: 2
+        - type: udp
+          decoder: sflow
+          listen: 103.27.116.65:6343
+          workers: 2
+
+outlet:
+  - http:
+      listen: 127.0.0.1:8082
+    metadata:
+      providers:
+        - type: static
+          exporters:
+            172.17.123.63:
+              name: JCR10-EQIX
+              skip-missing-interfaces: true
+              ifindexes:
+                732:
+                  name: ae22.0
+                  description: "Google"
+                  speed: 100000
+                744:
+                  name: ae23.0
+                  description: "Google"
+                  speed: 100000
+                807:
+                  name: ae26.0
+                  description: "CloudFlare"
+                  speed: 100000
+                866:
+                  name: ae30.0
+                  description: "CloudFlare"
+                  speed: 100000
+                796:
+                  name: ae29.300
+                  description: "Sparkel-Transit"
+                  speed: 100000
+                1627:
+                  name: ae7.599
+                  description: "Equinix-Peering"
+                  speed: 200000
+                1714:
+                  name: ae5.4091
+                  description: "TO_Apollo"
+                  speed: 100000
+                1735:
+                  name: ae83.1002
+                  description: "INFRA"
+                  speed: 100000
+                1355:
+                  name: ae21.387
+                  description: "To-JCR9"
+                  speed: 100000
+                934:
+                  name: ae35.416
+                  description: "To-JCR21"
+                  speed: 100000
+                774:
+                  name: ae12.383
+                  description: "To-JCR02"
+                  speed: 100000
+                16:
+                  name: lo0.0
+                  description: "Loopback"
+                  speed: 0
+    routing:
+      provider:
+        type: bmp
+        listen: 103.27.116.65:10179
+        collect-asns: true
+        collect-aspaths: true
+        collect-communities: true
+    core:
+      defaultsamplingrate: 100
+      exporter-classifiers:
+        - "true"
+      interface-classifiers:
+        - Interface.Description == "Google" &&
+          ClassifyConnectivity("peering") &&
+          ClassifyProvider("Google") &&
+          ClassifyExternal()
+        - Interface.Description == "CloudFlare" &&
+          ClassifyConnectivity("pni") &&
+          ClassifyProvider("CloudFlare") &&
+          ClassifyExternal()
+        - Interface.Description == "Equinix-Peering" &&
+          ClassifyConnectivity("peering") &&
+          ClassifyProvider("Equinix") &&
+          ClassifyExternal()
+        - Interface.Description == "Sparkel-Transit" &&
+          ClassifyConnectivity("transit") &&
+          ClassifyProvider("Sparkel") &&
+          ClassifyExternal()
+        - Interface.Description == "TO_Apollo" &&
+          ClassifyInternal()
+        - Interface.Description == "INFRA" &&
+          ClassifyInternal()
+        - Interface.Description startsWith "To-JCR" &&
+          ClassifyInternal()
+        - Interface.Description == "Loopback" &&
+          ClassifyInternal()
+        - ClassifyExternal()
+
+console:
+  - http:
+      listen: 172.16.3.101:8083
+```
+
+### 4.2 Validate Configuration
+
+```bash
+/usr/local/bin/akvorado orchestrator -C /etc/akvorado/config.yaml
+```
+
+---
+
+## 5. Service Management
+
+### 5.1 Control Script
+
+Location: `/usr/local/bin/akvorado-ctl.sh`
+
+```bash
+#!/bin/bash
+set -e
+
+KAFKA_BIN="/opt/kafka_2.13-3.9.1/bin"
+BROKER="localhost:9092"
+ORCH_URL="http://172.16.3.101:8080"
+CONFIG="/etc/akvorado/config.yaml"
+TOPIC="netplan-flows-v5"
+CONSUMER_GROUP="akvorado-outlet"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+log_info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
+
+countdown() {
+    local secs=$1
+    while [ $secs -gt 0 ]; do
+        echo -ne "\r  Waiting... ${secs}s "
+        sleep 1
+        : $((secs--))
+    done
+    echo -e "\r  Done.          "
+}
+
+case "$1" in
+  start)
+    log_info "Starting Akvorado services..."
+
+    log_info "Starting orchestrator..."
+    nohup /usr/local/bin/akvorado orchestrator $CONFIG > /var/log/akvorado-orchestrator.log 2>&1 &
+    countdown 60
+
+    log_info "Starting inlet..."
+    nohup /usr/local/bin/akvorado inlet $ORCH_URL > /var/log/akvorado-inlet.log 2>&1 &
+    countdown 30
+
+    log_info "Starting outlet..."
+    nohup /usr/local/bin/akvorado outlet $ORCH_URL > /var/log/akvorado-outlet.log 2>&1 &
+    countdown 30
+
+    log_info "Starting console..."
+    nohup /usr/local/bin/akvorado console $ORCH_URL > /var/log/akvorado-console.log 2>&1 &
+    countdown 30
+
+    log_info "All services started"
+    $0 status
+    ;;
+
+  stop)
+    log_info "Stopping Akvorado services..."
+    pkill -9 -f "/usr/local/bin/akvorado" 2>/dev/null || true
+    countdown 60
+    log_info "All services stopped"
+    ;;
+
+  restart)
+    $0 stop
+    $0 start
+    ;;
+
+  reset)
+    log_info "=== FULL RESET ==="
+
+    pkill -9 -f "/usr/local/bin/akvorado" 2>/dev/null || true
+    countdown 60
+
+    $KAFKA_BIN/kafka-consumer-groups.sh --bootstrap-server $BROKER \
+      --delete --group $CONSUMER_GROUP 2>/dev/null || true
+
+    $KAFKA_BIN/kafka-topics.sh --bootstrap-server $BROKER \
+      --delete --topic $TOPIC 2>/dev/null || true
+    sleep 3
+
+    $0 start
+    ;;
+
+  status)
+    echo "=== AKVORADO STATUS ==="
+    echo ""
+    echo "--- Processes ---"
+    pgrep -af "/usr/local/bin/akvorado" || echo "  No processes running"
+    echo ""
+    echo "--- Ports ---"
+    for port in 8080 8081 8082 8083 2055 6343 10179; do
+        if ss -tlnp 2>/dev/null | grep -q ":${port} " || ss -ulnp 2>/dev/null | grep -q ":${port} "; then
+            echo "  Port $port: OPEN"
+        else
+            echo "  Port $port: CLOSED"
+        fi
+    done
+    echo ""
+    echo "--- ClickHouse Flows ---"
+    total=$(clickhouse-client --password 'netflow2026' \
+      --query "SELECT count(*) FROM akvorado.flows" 2>/dev/null || echo "N/A")
+    recent=$(clickhouse-client --password 'netflow2026' \
+      --query "SELECT count(*) FROM akvorado.flows WHERE TimeReceived > now() - INTERVAL 5 MINUTE" 2>/dev/null || echo "N/A")
+    echo "  Total: $total"
+    echo "  Last 5 min: $recent"
+    ;;
+
+  logs)
+    for svc in orchestrator inlet outlet console; do
+        echo "--- $svc ---"
+        tail -10 /var/log/akvorado-$svc.log 2>/dev/null || echo "  No log file"
+    done
+    ;;
+
+  *)
+    echo "Usage: akvorado-ctl.sh {start|stop|restart|reset|status|logs}"
+    exit 1
+    ;;
+esac
+```
+
+### 5.2 Usage
+
+```bash
+sudo akvorado-ctl.sh start    # Start all services
+sudo akvorado-ctl.sh stop     # Stop all services
+sudo akvorado-ctl.sh restart  # Restart services
+sudo akvorado-ctl.sh reset    # Full reset with Kafka cleanup
+sudo akvorado-ctl.sh status   # Check status
+sudo akvorado-ctl.sh logs     # View recent logs
+```
+
+---
+
+## 6. Static Interface Metadata
+
+When SNMP is not available, use static metadata to define interfaces.
+
+### 6.1 Get Interface ifIndex from Juniper
+
+```
+show interfaces ae22.0 extensive | match "SNMP ifIndex"
+```
+
+Output:
+```
+  Logical interface ae22.0 (Index 370) (SNMP ifIndex 732) (Generation 182)
+```
+
+### 6.2 Configuration Format
+
+```yaml
+metadata:
+  providers:
+    - type: static
+      exporters:
+        <EXPORTER_IP>:
+          name: <EXPORTER_NAME>
+          skip-missing-interfaces: true
+          ifindexes:
+            <SNMP_IFINDEX>:
+              name: <INTERFACE_NAME>
+              description: <DESCRIPTION>
+              speed: <SPEED_IN_MBPS>
+```
+
+### 6.3 Interface Classifiers
+
+```yaml
+interface-classifiers:
+  # External - Peering
+  - Interface.Description == "Google" &&
+    ClassifyConnectivity("peering") &&
+    ClassifyProvider("Google") &&
+    ClassifyExternal()
+
+  # External - Transit
+  - Interface.Description == "Sparkel-Transit" &&
+    ClassifyConnectivity("transit") &&
+    ClassifyProvider("Sparkel") &&
+    ClassifyExternal()
+
+  # Internal
+  - Interface.Description == "TO_Apollo" &&
+    ClassifyInternal()
+
+  # Default fallback
+  - ClassifyExternal()
+```
+
+---
+
+## 7. BMP Configuration
+
+BMP (BGP Monitoring Protocol) provides AS path and community information.
+
+### 7.1 Akvorado Configuration
+
+```yaml
+outlet:
+  - routing:
+      provider:
+        type: bmp
+        listen: 103.27.116.65:10179
+        collect-asns: true
+        collect-aspaths: true
+        collect-communities: true
+```
+
+### 7.2 Juniper Router Configuration
+
+```
+set routing-options bmp station AKVORADO connection-mode active
+set routing-options bmp station AKVORADO station-address 103.27.116.65
+set routing-options bmp station AKVORADO station-port 10179
+set routing-options bmp station AKVORADO local-address 172.17.123.63
+set routing-options bmp station AKVORADO route-monitoring pre-policy
+set routing-options bmp station AKVORADO statistics-timeout 300
+```
+
+### 7.3 Firewall Rules
+
+**Linux Server:**
+```bash
+sudo ufw allow 10179/tcp comment "BMP from router"
+```
+
+**Juniper Router:**
+```
+set firewall family inet filter PROTECT-RE term ALLOW-BMP from destination-address 103.27.116.65/32
+set firewall family inet filter PROTECT-RE term ALLOW-BMP from protocol tcp
+set firewall family inet filter PROTECT-RE term ALLOW-BMP from destination-port 10179
+set firewall family inet filter PROTECT-RE term ALLOW-BMP then accept
+```
+
+### 7.4 Verify BMP Session
+
+**On Router:**
+```
+show bmp station AKVORADO
+```
+
+**On Server:**
+```bash
+curl -s http://127.0.0.1:8082/api/v0/outlet/metrics | grep bmp
+```
+
+---
+
+## 8. GeoIP Setup
+
+### 8.1 Create MaxMind Account
+
+1. Register at https://www.maxmind.com/en/geolite2/signup
+2. Generate license key
+
+### 8.2 Install geoipupdate
+
+```bash
+sudo add-apt-repository ppa:maxmind/ppa
+sudo apt update
+sudo apt install geoipupdate
+```
+
+### 8.3 Configure GeoIP
+
+```bash
+cat << 'EOF' | sudo tee /etc/GeoIP.conf
+AccountID 1296052
+LicenseKey YOUR_LICENSE_KEY
+EditionIDs GeoLite2-ASN GeoLite2-City GeoLite2-Country
+DatabaseDirectory /var/lib/akvorado/geoip
+EOF
+```
+
+### 8.4 Download Databases
+
+```bash
+sudo geoipupdate -v
+```
+
+### 8.5 Setup Daily Cron
+
+```bash
+echo "0 3 * * * root /usr/bin/geoipupdate" | sudo tee /etc/cron.d/geoipupdate
+```
+
+---
+
+## 9. Grafana Integration
+
+### 9.1 ClickHouse Data Source
+
+| Setting | Value |
+|---------|-------|
+| Host | 172.16.3.101:8123 |
+| Database | akvorado |
+| User | default |
+| Password | netflow2026 |
+
+### 9.2 Traffic Queries
+
+**Total Traffic (bps):**
+```sql
+SELECT
+    toStartOfMinute(TimeReceived) AS time,
+    sum(Bytes * SamplingRate * 8) / 60 AS bps
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY time
+ORDER BY time
+```
+
+**Traffic by Provider:**
+```sql
+SELECT
+    toStartOfMinute(TimeReceived) AS time,
+    InIfProvider AS provider,
+    sum(Bytes * SamplingRate * 8) / 60 AS bps
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY time, provider
+ORDER BY time
+```
+
+**Traffic by Interface:**
+```sql
+SELECT
+    toStartOfMinute(TimeReceived) AS time,
+    InIfName AS interface,
+    sum(Bytes * SamplingRate * 8) / 60 AS bps
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY time, interface
+ORDER BY time
+```
+
+### 9.3 Top-N Queries
+
+**Top 10 Source IPs (IPv4):**
+```sql
+SELECT
+    replaceRegexpOne(IPv6NumToString(SrcAddr), '^::ffff:', '') AS src_ip,
+    sum(Bytes * SamplingRate) AS total_bytes
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+  AND EType = 2048
+GROUP BY SrcAddr
+ORDER BY total_bytes DESC
+LIMIT 10
+```
+
+**Top 10 Destination IPs (IPv4):**
+```sql
+SELECT
+    replaceRegexpOne(IPv6NumToString(DstAddr), '^::ffff:', '') AS dst_ip,
+    sum(Bytes * SamplingRate) AS total_bytes
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+  AND EType = 2048
+GROUP BY DstAddr
+ORDER BY total_bytes DESC
+LIMIT 10
+```
+
+**Top 10 Source AS:**
+```sql
+SELECT
+    SrcAS,
+    sum(Bytes * SamplingRate) AS total_bytes
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY SrcAS
+ORDER BY total_bytes DESC
+LIMIT 10
+```
+
+**Top 10 Countries:**
+```sql
+SELECT
+    SrcCountry AS country,
+    sum(Bytes * SamplingRate) AS total_bytes
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY country
+ORDER BY total_bytes DESC
+LIMIT 10
+```
+
+### 9.4 Protocol Analysis
+
+**Traffic by Protocol:**
+```sql
+SELECT
+    toStartOfMinute(TimeReceived) AS time,
+    multiIf(Proto = 6, 'TCP', Proto = 17, 'UDP', Proto = 1, 'ICMP', toString(Proto)) AS protocol,
+    sum(Bytes * SamplingRate * 8) / 60 AS bps
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY time, protocol
+ORDER BY time
+```
+
+### 9.5 Connectivity Analysis
+
+**Peering vs Transit:**
+```sql
+SELECT
+    multiIf(
+        InIfConnectivity = 'peering', 'Peering',
+        InIfConnectivity = 'pni', 'PNI',
+        InIfConnectivity = 'transit', 'Transit',
+        'Other'
+    ) AS type,
+    sum(Bytes * SamplingRate) AS total_bytes
+FROM akvorado.flows
+WHERE TimeReceived >= $__fromTime AND TimeReceived <= $__toTime
+GROUP BY type
+ORDER BY total_bytes DESC
+```
+
+---
+
+## 10. ClickHouse Queries
+
+### 10.1 Connect to ClickHouse
+
+```bash
+clickhouse-client --password 'netflow2026'
+```
+
+### 10.2 Basic Queries
+
+```sql
+-- Total flow count
+SELECT count(*) FROM akvorado.flows;
+
+-- Flows in last 5 minutes
+SELECT count(*) FROM akvorado.flows
+WHERE TimeReceived > now() - INTERVAL 5 MINUTE;
+
+-- Database size
+SELECT
+    formatReadableSize(sum(bytes_on_disk)) AS size
+FROM system.parts
+WHERE database = 'akvorado';
+
+-- Recent flows sample
+SELECT
+    TimeReceived,
+    SrcAddr,
+    DstAddr,
+    SrcPort,
+    DstPort,
+    Proto,
+    Bytes
+FROM akvorado.flows
+ORDER BY TimeReceived DESC
+LIMIT 20;
+```
+
+### 10.3 Table Schema
+
+```sql
+DESCRIBE akvorado.flows;
+```
+
+Key columns:
+- `TimeReceived` - Flow timestamp
+- `SrcAddr`, `DstAddr` - IP addresses (IPv6 format)
+- `SrcPort`, `DstPort` - Port numbers
+- `Proto` - Protocol (6=TCP, 17=UDP, 1=ICMP)
+- `Bytes`, `Packets` - Flow size
+- `SamplingRate` - Sampling rate
+- `SrcAS`, `DstAS` - AS numbers
+- `SrcCountry`, `DstCountry` - Country codes
+- `InIfName`, `OutIfName` - Interface names
+- `InIfProvider`, `OutIfProvider` - Provider names
+- `DstASPath` - BGP AS path (from BMP)
+
+---
+
+## 11. Backup & Restoration
+
+### 11.1 Backup Paths
+
+| Component | Configuration | Data |
+|-----------|--------------|------|
+| Akvorado | `/etc/akvorado/` | `/var/lib/akvorado/` |
+| Kafka | `/opt/kafka_2.13-3.9.1/config/` | `/tmp/kafka-logs/` |
+| Zookeeper | `/opt/kafka_2.13-3.9.1/config/` | `/tmp/zookeeper/` |
+| ClickHouse | `/etc/clickhouse-server/` | `/var/lib/clickhouse/` |
+
+### 11.2 Backup Script
+
+```bash
+#!/bin/bash
+BACKUP_DIR="/backup/netflow-$(date +%Y%m%d)"
+sudo mkdir -p $BACKUP_DIR
+
+# Akvorado
+sudo cp -r /etc/akvorado $BACKUP_DIR/
+sudo cp -r /var/lib/akvorado $BACKUP_DIR/
+
+# Kafka config
+sudo cp -r /opt/kafka_2.13-3.9.1/config $BACKUP_DIR/kafka-config/
+
+# ClickHouse config
+sudo cp -r /etc/clickhouse-server $BACKUP_DIR/clickhouse-config/
+
+# ClickHouse data export
+clickhouse-client --password 'netflow2026' \
+  --query "SELECT * FROM akvorado.flows FORMAT Native" \
+  > $BACKUP_DIR/flows.native
+
+echo "Backup completed: $BACKUP_DIR"
+```
+
+### 11.3 Restoration Order
+
+1. ClickHouse (database)
+2. Zookeeper
+3. Kafka
+4. Akvorado
+
+---
+
+## 12. Capacity Planning
+
+### 12.1 Single Server Sizing
+
+| Traffic | CPU | RAM | Storage | Network |
+|---------|-----|-----|---------|---------|
+| < 10 Gbps | 8 cores | 32 GB | 1 TB SSD | 1 Gbps |
+| 10-100 Gbps | 16 cores | 64 GB | 5 TB SSD | 10 Gbps |
+| 100-500 Gbps | 32 cores | 128 GB | 10 TB NVMe | 25 Gbps |
+| 500-700 Gbps | 64+ cores | 256+ GB | 20+ TB NVMe | 25-100 Gbps |
+
+### 12.2 High Capacity (500-700 Gbps) Distributed Setup
+
+**Inlet Nodes (3-5):**
+- 16 cores, 32 GB RAM, 100 GB SSD
+- 8-16 workers per inlet
+
+**Kafka Cluster (3-5 nodes):**
+- 16 cores, 64 GB RAM, 2-5 TB NVMe
+- 64 partitions, replication factor 2
+
+**Outlet Nodes (3-5):**
+- 32 cores, 128 GB RAM, 200 GB SSD
+- 8-32 workers per outlet
+
+**ClickHouse Cluster (3-6 nodes):**
+- 32-64 cores, 256-512 GB RAM, 10-20 TB NVMe
+
+### 12.3 Linux Kernel Tuning
+
+```bash
+# /etc/sysctl.conf
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.core.rmem_default=33554432
+net.core.netdev_max_backlog=100000
+net.ipv4.udp_mem=8388608 12582912 16777216
+vm.swappiness=1
+vm.dirty_ratio=40
+vm.dirty_background_ratio=10
+```
+
+### 12.4 Sampling Rate Recommendations
+
+| Traffic | Recommended Sampling |
+|---------|---------------------|
+| < 100 Gbps | 1:1000 |
+| 100-500 Gbps | 1:2000 |
+| 500-700 Gbps | 1:2000 - 1:4000 |
+
+---
+
+## 13. Troubleshooting
+
+### 13.1 Common Issues
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| "metadata missing" | No static/SNMP metadata | Add static provider |
+| "address already in use" | Socket not released | Kill processes, wait 60s |
+| FlowDirection undefined | Interface not classified | Fix interface classifiers |
+| Empty InIfName/OutIfName | SNMP/static not working | Use static ifindexes |
+| DstASPath empty | No BMP | Configure BMP |
+| No flows in ClickHouse | Inlet not receiving | Check UDP connectivity |
+
+### 13.2 Check Commands
+
+```bash
+# Process status
+pgrep -af akvorado
+
+# Port status
+ss -tlnp | grep -E "8080|8081|8082|8083"
+ss -ulnp | grep -E "2055|6343"
+
+# Kafka topics
+/opt/kafka_2.13-3.9.1/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# Inlet metrics
+curl -s http://127.0.0.1:8081/api/v0/inlet/metrics | grep kafka_sent
+
+# Outlet metrics
+curl -s http://127.0.0.1:8082/api/v0/outlet/metrics | grep kafka_received
+
+# BMP metrics
+curl -s http://127.0.0.1:8082/api/v0/outlet/metrics | grep bmp
+
+# ClickHouse flows
+clickhouse-client --password 'netflow2026' \
+  --query "SELECT count(*) FROM akvorado.flows WHERE TimeReceived > now() - INTERVAL 5 MINUTE"
+```
+
+### 13.3 Log Files
+
+```bash
+tail -f /var/log/akvorado-orchestrator.log
+tail -f /var/log/akvorado-inlet.log
+tail -f /var/log/akvorado-outlet.log
+tail -f /var/log/akvorado-console.log
+```
+
+---
+
+## 14. Quick Reference
+
+### URLs
+
+| Service | URL |
+|---------|-----|
+| Web UI | http://172.16.3.101:8083 |
+| Orchestrator API | http://172.16.3.101:8080/api/v0/ |
+| Inlet Metrics | http://127.0.0.1:8081/api/v0/inlet/metrics |
+| Outlet Metrics | http://127.0.0.1:8082/api/v0/outlet/metrics |
+
+### Commands
+
+```bash
+# Service management
+sudo akvorado-ctl.sh start|stop|restart|reset|status|logs
+
+# Validate config
+/usr/local/bin/akvorado orchestrator -C /etc/akvorado/config.yaml
+
+# ClickHouse CLI
+clickhouse-client --password 'netflow2026'
+
+# Kafka topics
+/opt/kafka_2.13-3.9.1/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+
+# GeoIP update
+sudo geoipupdate -v
+```
+
+### File Locations
+
+| File | Path |
+|------|------|
+| Main config | `/etc/akvorado/config.yaml` |
+| Control script | `/usr/local/bin/akvorado-ctl.sh` |
+| GeoIP databases | `/var/lib/akvorado/geoip/` |
+| Akvorado logs | `/var/log/akvorado-*.log` |
+| Kafka config | `/opt/kafka_2.13-3.9.1/config/` |
+| ClickHouse config | `/etc/clickhouse-server/` |
+| ClickHouse data | `/var/lib/clickhouse/` |
+
+---
+
+**End of Guide**
