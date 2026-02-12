@@ -1,0 +1,133 @@
+http:
+  listen: 172.16.3.101:8080
+
+geoip:
+  asn-database: /var/lib/akvorado/geoip/GeoLite2-ASN.mmdb
+  geo-database: /var/lib/akvorado/geoip/GeoLite2-Country.mmdb
+
+kafka:
+  topic: netplan-flows
+  brokers:
+    - 127.0.0.1:9092
+
+clickhouse:
+  servers:
+    - 127.0.0.1:9000
+  database: akvorado
+  username: default
+  password: netflow2026
+
+inlet:
+  - http:
+      listen: 127.0.0.1:8081
+    flow:
+      inputs:
+        - type: udp
+          decoder: netflow
+          listen: 103.27.116.65:2055
+          workers: 2
+        - type: udp
+          decoder: sflow
+          listen: 103.27.116.65:6343
+          workers: 2
+
+outlet:
+  - http:
+      listen: 127.0.0.1:8082
+    metadata:
+      providers:
+        - type: static
+          exporters:
+            172.17.123.63:
+              name: JCR10-EQIX
+              skip-missing-interfaces: true
+              ifindexes:
+                732:
+                  name: ae22.0
+                  description: "Google_PNI-1"
+                  speed: 100000
+                744:
+                  name: ae23.0
+                  description: "Google_PNI-2"
+                  speed: 100000
+                807:
+                  name: ae26.0
+                  description: "CloudFlare_PNI-1"
+                  speed: 100000
+                866:
+                  name: ae30.0
+                  description: "CloudFlare_PNI-2"
+                  speed: 100000
+                796:
+                  name: ae29.300
+                  description: "Sparkel-Transit-ae29"
+                  speed: 200000
+                1627:
+                  name: ae7.599
+                  description: "Equinix-Peering-ae7"
+                  speed: 200000
+                1714:
+                  name: ae5.4091
+                  description: "TO_Apollo-ae5"
+                  speed: 80000
+                1735:
+                  name: ae83.1002
+                  description: "INFRA-ae83"
+                  speed: 90000
+                1355:
+                  name: ae21.387
+                  description: "To-JCR9-ae21"
+                  speed: 100000
+                934:
+                  name: ae35.416
+                  description: "To-JCR21-ae35"
+                  speed: 100000
+                774:
+                  name: ae12.383
+                  description: "To-JCR02-ae12"
+                  speed: 100000
+                16:
+                  name: lo0.0
+                  description: "Loopback-JCR10-EQIX"
+    routing:
+      provider:
+        type: bmp
+        listen: 103.27.116.65:10179
+        collect-asns: true
+        collect-aspaths: true
+        collect-communities: true
+
+    core:
+      defaultsamplingrate: 100
+      exporter-classifiers:
+        - "true"
+      interface-classifiers:
+        - Interface.Description == "Google" &&
+          ClassifyConnectivity("peering") &&
+          ClassifyProvider("Google") &&
+          ClassifyExternal()
+        - Interface.Description == "CloudFlare" &&
+          ClassifyConnectivity("pni") &&
+          ClassifyProvider("CloudFlare") &&
+          ClassifyExternal()
+        - Interface.Description == "Equinix-Peering" &&
+          ClassifyConnectivity("peering") &&
+          ClassifyProvider("Equinix") &&
+          ClassifyExternal()
+        - Interface.Description == "Sparkel-Transit" &&
+          ClassifyConnectivity("transit") &&
+          ClassifyProvider("Sparkel") &&
+          ClassifyExternal()
+        - Interface.Description == "TO_Apollo" &&
+          ClassifyInternal()
+        - Interface.Description == "INFRA" &&
+          ClassifyInternal()
+        - Interface.Description startsWith "To-JCR" &&
+          ClassifyInternal()
+        - Interface.Description == "Loopback" &&
+          ClassifyInternal()
+        - ClassifyExternal()
+
+console:
+  - http:
+      listen: 172.16.3.101:8083
