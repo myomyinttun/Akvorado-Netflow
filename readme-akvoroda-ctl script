@@ -1,0 +1,168 @@
+# Akvorado NetFlow Setup
+
+This directory contains configuration and control scripts for Akvorado v2.1.1 NetFlow/sFlow collector.
+
+## Architecture
+
+```
+                    ┌─────────────────┐
+                    │   Router/Switch │
+                    │  172.17.123.63  │
+                    └────────┬────────┘
+                             │ NetFlow/sFlow
+                             ▼
+┌────────────────────────────────────────────────────────────┐
+│                    Akvorado Server                         │
+│                                                            │
+│  ┌──────────────┐    ┌───────────┐    ┌──────────────┐    │
+│  │ Orchestrator │───▶│   Kafka   │◀───│    Inlet     │    │
+│  │   :8080      │    │   :9092   │    │    :8081     │    │
+│  └──────────────┘    └─────┬─────┘    └──────────────┘    │
+│                            │               ▲               │
+│                            ▼               │               │
+│  ┌──────────────┐    ┌───────────┐    UDP :2055/:6343     │
+│  │   Console    │    │   Outlet  │    103.27.116.65       │
+│  │   :8083      │    │   :8082   │                        │
+│  └──────────────┘    └─────┬─────┘                        │
+│                            │                              │
+│                            ▼                              │
+│                     ┌────────────┐                        │
+│                     │ ClickHouse │                        │
+│                     │   :9000    │                        │
+│                     └────────────┘                        │
+└────────────────────────────────────────────────────────────┘
+```
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `akvorado-ctl.sh` | Main control script (v1.x style with Kafka reset) |
+| `akvorado-ctl-v2.sh` | Simplified control script for v2.x |
+| `akvorado-reset.sh` | Full reset script with detailed health checks |
+| `config-v2.yaml` | Basic Akvorado configuration |
+| `config-v2-fixed.yaml` | Configuration with metadata provider settings |
+
+## Control Script Usage
+
+```bash
+# Start all services
+sudo akvorado-ctl.sh start
+
+# Stop all services
+sudo akvorado-ctl.sh stop
+
+# Restart services
+sudo akvorado-ctl.sh restart
+
+# Full reset (stop, delete Kafka topics, start fresh)
+sudo akvorado-ctl.sh reset
+
+# Check status
+sudo akvorado-ctl.sh status
+
+# View recent logs
+sudo akvorado-ctl.sh logs
+```
+
+## Service Ports
+
+| Port | Protocol | Service |
+|------|----------|---------|
+| 8080 | TCP | Orchestrator API |
+| 8081 | TCP | Inlet API |
+| 8082 | TCP | Outlet API |
+| 8083 | TCP | Console (Web UI) |
+| 2055 | UDP | NetFlow/IPFIX |
+| 6343 | UDP | sFlow |
+
+## Configuration
+
+Main configuration: `/etc/akvorado/config.yaml`
+
+Key settings:
+- Kafka broker: `127.0.0.1:9092`
+- ClickHouse: `127.0.0.1:9000` (password: netflow2026)
+- Flow input: `103.27.116.65:2055` (NetFlow), `103.27.116.65:6343` (sFlow)
+- Web UI: `http://172.16.3.101:8083`
+
+## ClickHouse Queries
+
+```bash
+# Connect to ClickHouse
+clickhouse-client --password 'netflow2026'
+
+# Total flow count
+SELECT count(*) FROM akvorado.flows;
+
+# Flows in last 5 minutes
+SELECT count(*) FROM akvorado.flows WHERE TimeReceived > now() - INTERVAL 5 MINUTE;
+
+# Top source IPs by bytes
+SELECT SrcAddr, sum(Bytes) as TotalBytes FROM akvorado.flows GROUP BY SrcAddr ORDER BY TotalBytes DESC LIMIT 10;
+
+# Top destination ports
+SELECT DstPort, count(*) as FlowCount FROM akvorado.flows GROUP BY DstPort ORDER BY FlowCount DESC LIMIT 10;
+
+# Traffic by protocol
+SELECT Proto, sum(Bytes) as TotalBytes FROM akvorado.flows GROUP BY Proto ORDER BY TotalBytes DESC;
+
+# Recent flows sample
+SELECT TimeReceived, SrcAddr, DstAddr, SrcPort, DstPort, Proto, Bytes FROM akvorado.flows ORDER BY TimeReceived DESC LIMIT 20;
+```
+
+## GeoIP Setup
+
+GeoIP databases location: `/var/lib/akvorado/geoip/`
+
+Update databases:
+```bash
+sudo geoipupdate -v
+```
+
+Cron job runs daily at 3 AM (see `/etc/cron.d/geoipupdate`).
+
+## Troubleshooting
+
+### Check if services are running
+```bash
+pgrep -af akvorado
+```
+
+### View service logs
+```bash
+tail -f /var/log/akvorado-orchestrator.log
+tail -f /var/log/akvorado-inlet.log
+tail -f /var/log/akvorado-outlet.log
+tail -f /var/log/akvorado-console.log
+```
+
+### Check Kafka topics
+```bash
+/opt/kafka_2.13-3.9.1/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+```
+
+### Verify flow reception
+```bash
+# Check inlet metrics
+curl -s http://127.0.0.1:8081/api/v0/inlet/metrics | grep kafka_sent
+
+# Check outlet metrics
+curl -s http://127.0.0.1:8082/api/v0/outlet/metrics | grep kafka_received
+```
+
+### Common Issues
+
+1. **"metadata missing" errors**: Ensure static metadata provider is configured in outlet section
+2. **"address already in use"**: Kill all akvorado processes and wait before restart
+3. **No flows in ClickHouse**: Check UDP connectivity to ports 2055/6343
+4. **Kafka consumer lag**: Run full reset to clear topic and restart fresh
+
+## Wait Times
+
+The control script uses these wait times to ensure services start properly:
+- Orchestrator: 60 seconds
+- Inlet: 30 seconds
+- Outlet: 30 seconds
+- Console: 30 seconds
+- Stop: 60 seconds
